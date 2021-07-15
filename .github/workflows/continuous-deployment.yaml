@@ -1,0 +1,149 @@
+name: Continuous deployment
+on:
+ push:
+   branches: ["master"]
+
+jobs:
+  # Compare cargo.toml version with existing tags
+  verify_new_version:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - run: git fetch --all --tags
+    - name: Check Release Version
+      uses: thebongy/version-check@v1
+      with:
+        file: Cargo.toml
+        tagFormat: v${version}
+      id: version_check
+    - name: Write new version to txt
+      shell: bash
+      run: |
+        echo ${{steps.version_check.outputs.rawVersion}} >> new-version.txt
+    - name: Store version as artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: new-version
+        path: new-version.txt
+
+  create_and_deploy_docker_images:
+    runs-on: ubuntu-latest
+    needs: ["verify_new_version"]
+    steps:
+      - name: Download new-version number
+        uses: actions/download-artifact@v2
+        with:
+          name: new-version
+      - run: |
+          echo "NEW_VERSION=$(cat new-version.txt)" >> $GITHUB_ENV;
+          #TODO: finish
+          
+  update_and_commit_trow_version_kustomize:
+    runs-on: ubuntu-latest
+    needs: ["create_and_deploy_docker_images"]
+    steps:
+      - name: Download new-version number
+        uses: actions/download-artifact@v2
+        with:
+          name: new-version
+      - run: |
+          echo "NEW_VERSION=$(cat new-version.txt)" >> $GITHUB_ENV;
+      - uses: actions/checkout@v2
+      - run: |
+          sed -i 's/newTag:.*$/newTag: ${{ env.NEW_VERSION }}/g' install/base/kustomization.yaml
+      - uses: EndBug/add-and-commit@v7
+        with:
+          add: 'install/base/kustomization.yaml'
+          author_name: automation-release
+          author_email: automation-release@github.com
+          message: 'Updated kustomize to use newest version.'
+
+  create_git_release_tag_and_github_release_object:
+    runs-on: ubuntu-latest
+    needs: ["update_and_commit_trow_version_kustomize"]
+    steps:
+      - name: Download new-version number
+        uses: actions/download-artifact@v2
+        id: version_check_staging
+        with:
+          name: new-version
+      - run: echo "NEW_VERSION=$(cat new-version.txt)" >> $GITHUB_ENV;
+      - uses: actions/checkout@v2
+      - name: Create and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v5.2
+        with:
+          default_bump: false
+          custom_tag: ${{ env.NEW_VERSION }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create a GitHub release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          release_name: Trow ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          draft: false
+          prerelease: false
+  
+  # Deploy our helm chart
+  # 1. Generate the .tgz file (helm package charts/trow/)
+  # 2. Update index.yaml (helm repo index . --merge charts/index.yaml --url https://trow.io/ )
+  # 3. Add the .tgz and index.yaml to the release repository
+  update_and_commit_and_deploy_helm_chart_version:
+    runs-on: ubuntu-latest
+    needs: ["create_git_release_tag_and_github_release_object"]
+    steps:
+      - name: Download new-version number
+        uses: actions/download-artifact@v2
+        with:
+          name: new-version
+      - run: |
+          echo "NEW_VERSION=$(cat new-version.txt)" >> $GITHUB_ENV;
+      - uses: actions/checkout@v2
+      - run: |
+          sed -i 's/^version:.*$/version: ${{ env.NEW_VERSION }}/g' charts/trow/Chart.yaml
+          sed -i 's/^appVersion:.*$/appVersion: ${{ env.NEW_VERSION }}/g' charts/trow/Chart.yaml
+      - uses: EndBug/add-and-commit@v7 # You can change this to use a specific version
+        with:
+          add: 'charts/trow/Chart.yaml'
+          author_name: automation-release
+          author_email: automation-release@github.com
+          message: 'Updated version and appVersion values in Chart.yaml for helm chart.'
+      - uses: azure/setup-helm@v1
+      - name: Create .tgz from helm chart and update index.yaml for helm repo
+        run: |
+          helm package charts/trow/ --destination charts/
+          helm repo index charts/ --merge charts/index.yaml --url https://trow.io/releases
+      - name: Upload index.yaml as artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: index
+          path: charts/index.yaml
+      - name: Upload .tgz file as artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: tgz
+          path: charts/trow-${{ env.NEW_VERSION }}.tgz
+      - name: Switch from master to gh-pages branch
+        uses: actions/checkout@v2
+        with:
+          ref: gh-pages
+      - name: Copy index.yaml to root of gh-pages branch
+        uses: actions/download-artifact@v2
+        with:
+          name: index
+      - name: Copy .tgz to the releases folder of gh-pages branch
+        uses: actions/download-artifact@v2
+        with:
+          name: tgz
+          path: releases/
+      - uses: EndBug/add-and-commit@v7
+        with:
+          add: '["index.yaml", "releases/trow-${{ env.NEW_VERSION }}.tgz"]'
+          author_name: automation-release
+          author_email: automation-release@github.com
+          message: 'Updated repository with latest helmchart version.'
+          branch: gh-pages

@@ -1,0 +1,29 @@
+name: Verify created PRs
+on: 
+    pull_request:
+        branches:
+            - main
+jobs:
+  # Compare cargo.toml verison with existing tags
+  verify_if_pr_triggers_cd:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - run: git fetch --all --tags
+    - name: Check Release Version
+      uses: thebongy/version-check@v1
+      with:
+        file: Cargo.toml
+        tagFormat: v${version}
+        failBuild: false
+      id: version_check
+    - name: Comment on PR
+      uses: actions/github-script@0.3.0
+      if: ${{ steps.version_check.outputs.versionChanged == 'true' }}
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { issue: { number: issue_number }, repo: { owner, repo }  } = context;
+          github.issues.createComment({ issue_number, owner, repo, body: 'Be aware that you will trigger our CD pipeline as the version in Cargo.toml has not yet been released.' });
+ 
+  
